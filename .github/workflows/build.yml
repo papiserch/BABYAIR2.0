@@ -1,0 +1,100 @@
+name: Build BABY AIR
+
+on:
+  push:
+    branches: [ main, master ]
+    tags: [ 'v*' ]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  BUILD_TYPE: Release
+
+jobs:
+  # Fast, JUCE-free: compiles and runs the DSP validation suite.
+  dsp-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake -B build-tests -DCMAKE_BUILD_TYPE=Release -DBABY_AIR_BUILD_PLUGIN=OFF
+      - name: Build
+        run: cmake --build build-tests --config Release -j 4
+      - name: Run DSP tests
+        run: ./build-tests/Source/Tests/baby_air_dsp_tests | tee dsp-test-report.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: dsp-test-report
+          path: dsp-test-report.txt
+
+  plugin:
+    needs: dsp-tests
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: Windows, os: windows-latest }
+          - { name: macOS,   os: macos-latest }
+          - { name: Linux,   os: ubuntu-latest }
+    name: Plugin (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev libx11-dev libxcomposite-dev libxcursor-dev libxext-dev \
+            libxinerama-dev libxrandr-dev libxrender-dev libfreetype-dev libfontconfig1-dev
+
+      - name: Cache JUCE download
+        uses: actions/cache@v4
+        with:
+          path: build/_deps
+          key: juce-8.0.6-${{ runner.os }}
+
+      - name: Configure
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            cmake -B build -DCMAKE_BUILD_TYPE=$BUILD_TYPE -DBABY_AIR_BUILD_TESTS=OFF "-DCMAKE_OSX_ARCHITECTURES=arm64;x86_64"
+          else
+            cmake -B build -DCMAKE_BUILD_TYPE=$BUILD_TYPE -DBABY_AIR_BUILD_TESTS=OFF
+          fi
+
+      - name: Build
+        run: cmake --build build --config Release -j 4
+
+      - name: Collect artefacts
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp -R build/BabyAir_artefacts/Release/VST3 dist/ 2>/dev/null || cp -R build/BabyAir_artefacts/VST3 dist/ || true
+          cp -R build/BabyAir_artefacts/Release/AU dist/ 2>/dev/null || cp -R build/BabyAir_artefacts/AU dist/ 2>/dev/null || true
+          cp -R build/BabyAir_artefacts/Release/Standalone dist/ 2>/dev/null || cp -R build/BabyAir_artefacts/Standalone dist/ 2>/dev/null || true
+          find dist -maxdepth 3 | head -40
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: BABY_AIR-${{ matrix.name }}
+          path: dist
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: plugin
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artefacts
+      - name: Zip each platform
+        run: |
+          cd artefacts
+          for d in BABY_AIR-*; do (cd "$d" && zip -r "../$d.zip" .); done
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: artefacts/*.zip
